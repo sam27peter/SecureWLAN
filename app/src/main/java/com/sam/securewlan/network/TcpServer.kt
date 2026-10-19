@@ -9,6 +9,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 import java.util.concurrent.Executors
 
 class TcpServer(
@@ -18,9 +19,15 @@ class TcpServer(
 ) {
     companion object {
         const val PORT = 8988
-        private const val MAGIC = 0x53574631 // "SWF1"
-        private const val MAX_FILE_SIZE = 500L * 1024L * 1024L // 500 MB
+
+        // Must match TcpClient protocol version 2.
+        private const val MAGIC = 0x53574632
+        private const val MAX_FILE_SIZE = 500L * 1024L * 1024L
         private const val BUFFER_SIZE = 64 * 1024
+        private const val SHA256_LENGTH = 32
+        private const val SOCKET_TIMEOUT_MS = 120_000
+        private const val MAX_FILENAME_LENGTH = 150
+        private const val MAX_MIME_LENGTH = 200
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -36,13 +43,14 @@ class TcpServer(
 
     fun start() {
         if (running) return
-
         running = true
 
         try {
             executor.execute {
                 try {
-                    receiveDirectory.mkdirs()
+                    if (!receiveDirectory.exists() && !receiveDirectory.mkdirs()) {
+                        throw IOException("Cannot create receive directory.")
+                    }
 
                     ServerSocket(PORT).use { server ->
                         serverSocket = server
@@ -51,17 +59,14 @@ class TcpServer(
                         while (running) {
                             val client = server.accept()
                             activeClient = client
-
                             try {
                                 client.use { socket ->
-                                    socket.soTimeout = 30_000
+                                    socket.soTimeout = SOCKET_TIMEOUT_MS
                                     socket.tcpNoDelay = true
-
                                     onStatus(
                                         "Connected to " +
                                                 socket.inetAddress.hostAddress
                                     )
-
                                     handleClient(socket)
                                 }
                             } catch (e: Exception) {
@@ -78,10 +83,7 @@ class TcpServer(
                     }
                 } catch (e: Exception) {
                     if (running) {
-                        onStatus(
-                            "Server error: " +
-                                    (e.message ?: "Unknown error")
-                        )
+                        onStatus("Server error: ${e.message ?: "Unknown error"}")
                     }
                 } finally {
                     running = false
@@ -92,27 +94,21 @@ class TcpServer(
             }
         } catch (e: Exception) {
             running = false
-            onStatus("Unable to start server: ${e.message}")
+            onStatus("Unable to start server: ${e.message ?: "Unknown error"}")
         }
     }
 
     private fun handleClient(socket: Socket) {
-        val input = DataInputStream(
-            BufferedInputStream(socket.getInputStream())
-        )
-        val output = DataOutputStream(
-            BufferedOutputStream(socket.getOutputStream())
-        )
-
-        var destination: File? = null
+        val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+        val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+        var partialFile: File? = null
 
         try {
             val magic = input.readInt()
 
+            // Keep compatibility with the existing connection-test request.
             if (magic != MAGIC) {
                 val received = StringBuilder()
-
-                // The first four bytes were already read by readInt().
                 received.append(
                     byteArrayOf(
                         (magic shr 24).toByte(),
@@ -138,98 +134,103 @@ class TcpServer(
                     return
                 }
 
-                sendResponse(output, false, "Invalid SecureWLAN protocol.")
+                sendResponse(output, false, "Unsupported protocol. Update both devices.")
                 return
             }
 
-            val fileName = sanitizeFileName(input.readUTF())
+            val fileNameRaw = input.readUTF()
             val mimeType = input.readUTF()
             val fileSize = input.readLong()
 
-            if (fileSize < 0 || fileSize > MAX_FILE_SIZE) {
-                sendResponse(
-                    output,
-                    false,
-                    "Invalid file size. Maximum supported size is 500 MB."
-                )
-                return
+            if (fileNameRaw.length > MAX_FILENAME_LENGTH) {
+                throw IOException("Filename is too long.")
+            }
+            if (mimeType.isBlank() || mimeType.length > MAX_MIME_LENGTH) {
+                throw IOException("Invalid MIME type.")
+            }
+            if (fileSize <= 0L || fileSize > MAX_FILE_SIZE) {
+                throw IOException("Invalid file size. Maximum supported size is 500 MB.")
             }
 
-            if (fileName.isBlank()) {
-                sendResponse(output, false, "Invalid filename.")
-                return
+            val expectedDigest = ByteArray(SHA256_LENGTH)
+            input.readFully(expectedDigest)
+
+            val fileName = sanitizeFileName(fileNameRaw)
+            onStatus("Receiving $fileName (${formatBytes(fileSize)})")
+
+            val finalFile = createUniqueFile(fileName)
+            partialFile = File(receiveDirectory, ".${finalFile.name}.part")
+            if (partialFile!!.exists()) {
+                if (!partialFile!!.delete()) {
+                    throw IOException("Cannot clear previous partial file.")
+                }
             }
 
-            // The MIME type is metadata only; do not trust it as proof
-            // that the incoming content is really that file type.
-            onStatus(
-                "Receiving $fileName " +
-                        "(${formatBytes(fileSize)})"
-            )
-
-            destination = createUniqueFile(fileName)
-
+            val digest = MessageDigest.getInstance("SHA-256")
             var received = 0L
             val buffer = ByteArray(BUFFER_SIZE)
 
-            FileOutputStream(destination).use { fileOutput ->
+            FileOutputStream(partialFile!!).use { fileOutput ->
                 while (received < fileSize) {
-                    if (!running) {
-                        throw IOException("Receiver stopped.")
-                    }
+                    if (!running) throw IOException("Receiver stopped.")
 
                     val bytesToRead = minOf(
                         buffer.size.toLong(),
                         fileSize - received
                     ).toInt()
-
                     val count = input.read(buffer, 0, bytesToRead)
 
-                    if (count == -1) {
-                        throw IOException(
-                            "Connection ended before the full file arrived."
-                        )
+                    if (count < 0) {
+                        throw IOException("Connection ended before the full file arrived.")
                     }
+                    if (count == 0) continue
 
                     fileOutput.write(buffer, 0, count)
+                    digest.update(buffer, 0, count)
                     received += count
                 }
-
                 fileOutput.flush()
+                fileOutput.fd.sync()
             }
 
-            if (destination.length() != fileSize) {
+            if (partialFile!!.length() != fileSize) {
                 throw IOException("Received file size verification failed.")
             }
 
+            val actualDigest = digest.digest()
+            if (!MessageDigest.isEqual(expectedDigest, actualDigest)) {
+                throw IOException("SHA-256 verification failed. The received file may be corrupted.")
+            }
+
+            // Only publish the file after size and digest verification succeed.
+            if (!partialFile!!.renameTo(finalFile)) {
+                throw IOException("Could not finalize the verified received file.")
+            }
+            partialFile = null
+
+            val digestHex = actualDigest.toHex()
             val message =
                 "Received: $fileName\n" +
                         "Type: $mimeType\n" +
                         "Size: ${formatBytes(fileSize)}\n" +
-                        "Saved to: ${destination.absolutePath}"
+                        "SHA-256 verified: $digestHex\n" +
+                        "Saved to: ${finalFile.absolutePath}"
 
             sendResponse(output, true, message)
             onMessage(message)
-            onStatus("Transfer completed: $fileName")
+            onStatus("Transfer completed and verified: $fileName")
         } catch (e: Exception) {
-            destination?.let {
-                try {
-                    if (it.exists()) it.delete()
-                } catch (_: Exception) {
-                    // Best-effort cleanup of an incomplete file.
-                }
+            try {
+                partialFile?.let { if (it.exists()) it.delete() }
+            } catch (_: Exception) {
+                // Best-effort cleanup of incomplete data.
             }
 
             try {
-                sendResponse(
-                    output,
-                    false,
-                    e.message ?: "File transfer failed."
-                )
+                sendResponse(output, false, e.message ?: "File transfer failed.")
             } catch (_: Exception) {
                 // The client may already have disconnected.
             }
-
             throw e
         }
     }
@@ -250,13 +251,12 @@ class TcpServer(
             .substringAfterLast('/')
             .trim()
 
-        val safeName = leafName
+        return leafName
             .replace(Regex("[^A-Za-z0-9._ -]"), "_")
-            .take(150)
+            .take(MAX_FILENAME_LENGTH)
             .trim()
             .trim('.')
-
-        return safeName.ifBlank { "received_file" }
+            .ifBlank { "received_file" }
     }
 
     private fun createUniqueFile(fileName: String): File {
@@ -270,42 +270,30 @@ class TcpServer(
 
         var candidate = File(receiveDirectory, fileName)
         var index = 1
-
         while (candidate.exists()) {
-            candidate = File(
-                receiveDirectory,
-                "${base}_$index$extension"
-            )
+            candidate = File(receiveDirectory, "${base}_$index$extension")
             index++
         }
-
         return candidate
     }
 
-    private fun formatBytes(bytes: Long): String {
-        return when {
-            bytes < 1_000L ->
-                "$bytes B"
-
-            bytes < 1_000_000L ->
-                String.format("%.2f KB", bytes / 1_000.0)
-
-            bytes < 1_000_000_000L ->
-                String.format("%.2f MB", bytes / 1_000_000.0)
-
-            else ->
-                String.format("%.2f GB", bytes / 1_000_000_000.0)
+    private fun formatBytes(bytes: Long): String =
+        when {
+            bytes < 1_000L -> "$bytes B"
+            bytes < 1_000_000L -> String.format("%.2f KB", bytes / 1_000.0)
+            bytes < 1_000_000_000L -> String.format("%.2f MB", bytes / 1_000_000.0)
+            else -> String.format("%.2f GB", bytes / 1_000_000_000.0)
         }
-    }
+
+    private fun ByteArray.toHex(): String =
+        joinToString("") { byte -> "%02x".format(byte) }
 
     fun stop() {
         running = false
-
         try {
             activeClient?.close()
         } catch (_: Exception) {
         }
-
         try {
             serverSocket?.close()
         } catch (_: Exception) {

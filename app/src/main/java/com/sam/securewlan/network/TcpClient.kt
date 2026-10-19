@@ -13,21 +13,24 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.MessageDigest
 import java.util.concurrent.Executors
 
 class TcpClient {
 
     companion object {
-        private const val MAGIC = 0x53574631 // "SWF1"
+        // SWF2: protocol version 2, including SHA-256 integrity verification.
+        private const val MAGIC = 0x53574632
         private const val MAX_FILE_SIZE = 500L * 1024L * 1024L
         private const val BUFFER_SIZE = 64 * 1024
+        private const val SHA256_LENGTH = 32
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val SOCKET_TIMEOUT_MS = 120_000
     }
 
     private val executor = Executors.newSingleThreadExecutor()
 
-    /**
-     * Retained for the existing connection-test button.
-     */
+    /** Retained for the existing connection-test button. */
     fun testConnection(
         host: String,
         port: Int = TcpServer.PORT,
@@ -36,11 +39,8 @@ class TcpClient {
         executor.execute {
             val result = try {
                 Socket().use { socket ->
-                    socket.connect(
-                        InetSocketAddress(host, port),
-                        5000
-                    )
-                    socket.soTimeout = 5000
+                    socket.connect(InetSocketAddress(host.trim(), port), 5_000)
+                    socket.soTimeout = 5_000
 
                     val output = socket.getOutputStream()
                     val input = socket.getInputStream()
@@ -49,17 +49,14 @@ class TcpClient {
                     output.flush()
 
                     val response = StringBuilder()
-
                     while (true) {
                         val next = input.read()
                         if (next == -1 || next == '\n'.code) break
                         response.append(next.toChar())
-
                         if (response.length > 4096) {
                             throw IOException("Response too long.")
                         }
                     }
-
                     response.toString().ifBlank {
                         "Connection closed without a reply."
                     }
@@ -67,13 +64,13 @@ class TcpClient {
             } catch (e: Exception) {
                 "Connection failed: ${e.message ?: "Unknown error"}"
             }
-
             onResult(result)
         }
     }
 
     /**
-     * Sends the selected document using a binary-safe protocol.
+     * Stages the selected document to a temporary file so its exact byte count
+     * and SHA-256 digest are known before the protocol header is sent.
      * Progress is reported as 0..100.
      */
     fun sendFile(
@@ -86,19 +83,13 @@ class TcpClient {
     ) {
         executor.execute {
             var temporaryFile: File? = null
-
             val result = try {
                 val resolver = context.contentResolver
-
                 var fileName = "selected_file"
-                var fileSize: Long? = null
 
                 resolver.query(
                     uri,
-                    arrayOf(
-                        OpenableColumns.DISPLAY_NAME,
-                        OpenableColumns.SIZE
-                    ),
+                    arrayOf(OpenableColumns.DISPLAY_NAME),
                     null,
                     null,
                     null
@@ -106,125 +97,89 @@ class TcpClient {
                     if (cursor.moveToFirst()) {
                         val nameIndex =
                             cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-
-                        val sizeIndex =
-                            cursor.getColumnIndex(OpenableColumns.SIZE)
-
                         if (nameIndex >= 0) {
-                            fileName =
-                                cursor.getString(nameIndex) ?: fileName
-                        }
-
-                        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
-                            fileSize = cursor.getLong(sizeIndex)
+                            fileName = cursor.getString(nameIndex) ?: fileName
                         }
                     }
                 }
 
-                val mimeType =
-                    resolver.getType(uri) ?: "application/octet-stream"
+                fileName = sanitizeDisplayName(fileName)
+                val mimeType = (resolver.getType(uri) ?: "application/octet-stream")
+                    .take(200)
 
-                // Some document providers don't report the file size.
-                // Stage those files to cache so the protocol has an exact size.
-                if (fileSize == null || fileSize!! < 0) {
-                    temporaryFile = File.createTempFile(
-                        "securewlan_",
-                        ".tmp",
-                        context.cacheDir
-                    )
+                temporaryFile = File.createTempFile(
+                    "securewlan_send_",
+                    ".tmp",
+                    context.cacheDir
+                )
 
-                    resolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(temporaryFile!!).use { output ->
-                            input.copyTo(output, BUFFER_SIZE)
-                        }
-                    } ?: throw IOException("Unable to open selected file.")
+                resolver.openInputStream(uri)?.use { source ->
+                    FileOutputStream(temporaryFile!!).use { destination ->
+                        source.copyTo(destination, BUFFER_SIZE)
+                    }
+                } ?: throw IOException("Unable to open selected file.")
 
-                    fileSize = temporaryFile!!.length()
+                val stagedFile = temporaryFile!!
+                val totalBytes = stagedFile.length()
+
+                if (totalBytes <= 0L) {
+                    throw IOException("The selected file is empty.")
                 }
-
-                val totalBytes = fileSize!!
-
                 if (totalBytes > MAX_FILE_SIZE) {
                     throw IOException("Maximum supported file size is 500 MB.")
                 }
 
-                if (totalBytes == 0L) {
-                    throw IOException("The selected file is empty.")
-                }
+                val digest = sha256(stagedFile)
 
                 Socket().use { socket ->
                     socket.connect(
                         InetSocketAddress(host.trim(), port),
-                        10_000
+                        CONNECT_TIMEOUT_MS
                     )
-                    socket.soTimeout = 120_000
+                    socket.soTimeout = SOCKET_TIMEOUT_MS
                     socket.tcpNoDelay = true
 
                     val output = DataOutputStream(
-                        BufferedOutputStream(
-                            socket.getOutputStream()
-                        )
+                        BufferedOutputStream(socket.getOutputStream())
                     )
-
                     val input = DataInputStream(
-                        BufferedInputStream(
-                            socket.getInputStream()
-                        )
+                        BufferedInputStream(socket.getInputStream())
                     )
 
-                    // Header: magic, filename, MIME type, byte count.
+                    // Protocol v2 header: magic, UTF filename, UTF MIME type,
+                    // byte count, 32-byte SHA-256 digest, then exactly fileSize bytes.
                     output.writeInt(MAGIC)
-                    output.writeUTF(fileName.take(200))
-                    output.writeUTF(mimeType.take(200))
+                    output.writeUTF(fileName)
+                    output.writeUTF(mimeType)
                     output.writeLong(totalBytes)
+                    output.write(digest)
 
                     var sentBytes = 0L
                     val buffer = ByteArray(BUFFER_SIZE)
-
-                    val fileInput = if (temporaryFile != null) {
-                        FileInputStream(temporaryFile!!)
-                    } else {
-                        resolver.openInputStream(uri)
-                            ?: throw IOException(
-                                "Unable to reopen selected file."
-                            )
-                    }
-
-                    fileInput.use { source ->
+                    FileInputStream(stagedFile).use { source ->
                         while (sentBytes < totalBytes) {
                             val wanted = minOf(
                                 buffer.size.toLong(),
                                 totalBytes - sentBytes
                             ).toInt()
-
                             val count = source.read(buffer, 0, wanted)
-
-                            if (count == -1) {
-                                throw IOException(
-                                    "Source file ended unexpectedly."
-                                )
+                            if (count < 0) {
+                                throw IOException("Staged file ended unexpectedly.")
                             }
+                            if (count == 0) continue
 
                             output.write(buffer, 0, count)
                             sentBytes += count
-
-                            onProgress(
-                                ((sentBytes * 100) / totalBytes).toInt()
-                            )
+                            onProgress(((sentBytes * 100) / totalBytes).toInt())
                         }
                     }
-
                     output.flush()
 
-                    // The receiver acknowledges only after saving the file.
                     val success = input.readBoolean()
                     val message = input.readUTF()
+                    if (!success) throw IOException(message)
 
-                    if (!success) {
-                        throw IOException(message)
-                    }
-
-                    "Transfer successful!\n$message"
+                    "Transfer successful!\n$message\nSHA-256: ${digest.toHex()}"
                 }
             } catch (e: Exception) {
                 "Transfer failed: ${e.message ?: "Unknown error"}"
@@ -232,12 +187,39 @@ class TcpClient {
                 try {
                     temporaryFile?.delete()
                 } catch (_: Exception) {
+                    // Best-effort cleanup of the staged source copy.
                 }
             }
 
             onResult(result)
         }
     }
+
+    private fun sha256(file: File): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest()
+    }
+
+    private fun sanitizeDisplayName(input: String): String {
+        val leaf = input.replace('\\', '/').substringAfterLast('/').trim()
+        return leaf
+            .replace(Regex("[^A-Za-z0-9._ -]"), "_")
+            .take(150)
+            .trim()
+            .trim('.')
+            .ifBlank { "selected_file" }
+    }
+
+    private fun ByteArray.toHex(): String =
+        joinToString("") { byte -> "%02x".format(byte) }
 
     fun shutdown() {
         executor.shutdownNow()
