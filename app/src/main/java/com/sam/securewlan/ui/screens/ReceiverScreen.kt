@@ -42,6 +42,10 @@ import java.io.File
 import java.io.IOException
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.graphics.asImageBitmap
+import com.sam.securewlan.network.PairingQr
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
@@ -52,6 +56,14 @@ fun ReceiverScreen(onBack: () -> Unit) {
     var ipAddress by remember { mutableStateOf("Not available") }
     var status by remember { mutableStateOf("Not connected") }
     var isListening by remember { mutableStateOf(false) }
+
+    val pairingQrBitmap = remember(ipAddress, isListening) {
+        if (isListening && ipAddress != "Not available") {
+            PairingQr.createBitmap(ipAddress, TcpServer.PORT)
+        } else {
+            null
+        }
+    }
     var receivedMessage by remember {
         mutableStateOf("No file received yet.")
     }
@@ -237,9 +249,24 @@ fun ReceiverScreen(onBack: () -> Unit) {
                         "Receiver details",
                         style = MaterialTheme.typography.titleLarge
                     )
-                    Text("IP address: $ipAddress")
-                    Text("Port: ${TcpServer.PORT}")
                     Text("Status: $status")
+
+                    if (isListening && pairingQrBitmap != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Image(
+                            bitmap = pairingQrBitmap.asImageBitmap(),
+                            contentDescription = "SecureWLAN receiver pairing QR code",
+                            modifier = Modifier.size(240.dp)
+                        )
+
+                        Text("Scan this QR code from the sending phone.")
+                    } else {
+                        Text(
+                            "Start receiving to generate a pairing QR code.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
             }
 
@@ -333,14 +360,14 @@ fun ReceiverScreen(onBack: () -> Unit) {
                         receivedFileName != null,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Save Received File to Phone")
+                Text("Choose Where to Save File")
             }
 
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
-                "Files remain in the app's private storage until you save " +
-                        "them to a location such as Downloads or Documents.",
+                "Choose a destination in the system picker, such as Downloads, " +
+                        "Documents, an SD card, or another available folder.",
                 style = MaterialTheme.typography.bodySmall
             )
         }

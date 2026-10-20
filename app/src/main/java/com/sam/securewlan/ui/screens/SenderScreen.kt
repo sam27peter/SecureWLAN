@@ -17,13 +17,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -36,11 +34,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.sam.securewlan.network.TcpClient
 import com.sam.securewlan.network.TcpServer
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import com.sam.securewlan.network.PairingQr
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 
@@ -151,6 +151,38 @@ fun SenderScreen(onBack: () -> Unit) {
 
     val tcpClient = remember { TcpClient() }
 
+    val qrScannerLauncher = rememberLauncherForActivityResult(
+        contract = ScanContract()
+    ) { scanResult ->
+        val contents = scanResult.contents
+
+        if (contents.isNullOrBlank()) {
+            connectionStatus = "QR scan cancelled."
+        } else {
+            val pairing = PairingQr.parse(contents)
+
+            if (pairing == null) {
+                connectionStatus =
+                    "Invalid SecureWLAN QR. Scan the receiver's pairing code."
+            } else if (!localNetworkGranted) {
+                connectionStatus = "Grant local network permission first."
+                permissionLauncher.launch(permissionName)
+            } else {
+                receiverIp = pairing.host
+                connectionStatus = "Receiver QR scanned. Connecting..."
+
+                tcpClient.testConnection(
+                    host = pairing.host,
+                    port = pairing.port
+                ) { result ->
+                    mainHandler.post {
+                        connectionStatus = result
+                    }
+                }
+            }
+        }
+    }
+
     DisposableEffect(tcpClient) {
         onDispose { tcpClient.shutdown() }
     }
@@ -222,37 +254,27 @@ fun SenderScreen(onBack: () -> Unit) {
                 Text(it, color = MaterialTheme.colorScheme.error)
             }
 
-            OutlinedTextField(
-                value = receiverIp,
-                onValueChange = { receiverIp = it },
-                label = { Text("Receiver IP address") },
-                placeholder = { Text("192.168.1.100") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isTransferring
-            )
-
-            Button(
+            OutlinedButton(
                 onClick = {
                     if (!localNetworkGranted) {
                         connectionStatus = "Grant local network permission first."
                         permissionLauncher.launch(permissionName)
                     } else {
-                        connectionStatus = "Testing connection..."
-                        tcpClient.testConnection(
-                            host = receiverIp.trim(),
-                            port = TcpServer.PORT
-                        ) { result ->
-                            mainHandler.post { connectionStatus = result }
-                        }
+                        val options = ScanOptions()
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("Scan the receiver's SecureWLAN QR code")
+                            .setBeepEnabled(false)
+                            .setOrientationLocked(false)
+
+                        qrScannerLauncher.launch(options)
                     }
                 },
-                enabled = receiverIp.isNotBlank() && !isTransferring,
+                enabled = !isTransferring,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Test Connection")
+                Text("Pair with Receiver (Scan QR)")
             }
+
 
             Button(
                 onClick = {
@@ -262,7 +284,7 @@ fun SenderScreen(onBack: () -> Unit) {
                     if (file == null) {
                         connectionStatus = "Choose an image or PDF first."
                     } else if (host.isBlank()) {
-                        connectionStatus = "Enter the receiver's IP address."
+                        connectionStatus = "Scan the receiver QR code first."
                     } else if (!localNetworkGranted) {
                         connectionStatus = "Grant local network permission first."
                         permissionLauncher.launch(permissionName)
