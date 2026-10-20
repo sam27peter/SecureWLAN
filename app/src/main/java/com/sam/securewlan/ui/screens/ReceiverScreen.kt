@@ -40,6 +40,8 @@ import com.sam.securewlan.network.NetworkUtils
 import com.sam.securewlan.network.TcpServer
 import java.io.File
 import java.io.IOException
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
@@ -213,6 +215,7 @@ fun ReceiverScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
